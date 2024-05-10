@@ -255,7 +255,7 @@ public:
     {
     }
 
-    void Construct(const uint8_t busNumber, uint32_t i2sSampleRate)
+    void Construct(const uint8_t busNumber)
     {
         // construct only once on first time called
         if (LcdBuffer == nullptr)
@@ -374,9 +374,9 @@ public:
         _muxId = s_context.MuxMap.RegisterNewMuxBus(dataSize);
     }
 
-    void Initialize(uint8_t pin, uint32_t i2sSampleRate)
+    void Initialize(uint8_t pin)
     {
-        s_context.Construct(0, i2sSampleRate);
+        s_context.Construct(0);
         //i2sSetPins(T_BUS::LcdBusNumber, pin, _muxId, s_context.MuxMap.MuxBusDataSize, invert);
         // TODO: lcd set pins?
     }
@@ -469,7 +469,7 @@ public:
 
     void Initialize()
     {
-        _bus.Initialize(_pin, T_SPEED::LcdSampleRate);
+        _bus.Initialize(_pin);
     }
 
     template <typename T_COLOR_OBJECT,
@@ -559,7 +559,6 @@ typedef NeoEsp32LcdMuxBus<NeoEspLcdMonoBuffContext<NeoEspLcdMuxMap<uint16_t, Neo
 class NeoEsp32LcdSpeedWs2812x
 {
 public:
-    const static uint32_t LcdSampleRate = 100000;
     const static uint16_t ByteSendTimeUs = 10;
     const static uint16_t ResetTimeUs = 300;
 };
