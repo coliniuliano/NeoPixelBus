@@ -18,88 +18,40 @@ extern "C"
 //   0123456789abcdef
 //   efcdab8967452301
 
-//
-// true size of mux channel, 16 bit
-//
-class NeoEspLcdMuxBusSize16Bit
+class NeoEspLcdMuxBusSize8Bit
 {
 public:
-    NeoEspLcdMuxBusSize16Bit() {};
+    NeoEspLcdMuxBusSize8Bit() {};
 
-    const static size_t MuxBusDataSize = 2;
+    const static size_t MuxBusDataSize = 1;
 
     static void EncodeIntoDma(uint8_t** dmaBuffer, const uint8_t* data, size_t sizeData, uint8_t muxId)
     {
 #if defined(CONFIG_IDF_TARGET_ESP32S2)
-        // // 1234 5678 - order
-        // // 3412 7856 = actual due to endianness
-        // // not swap                         0000000000000001 
-        // const uint64_t EncodedZeroBit64 = 0x0000000000010000;
-        // //  no swap                         0000000100010001 
-        // const uint64_t EncodedOneBit64 =  0x0001000000010001; 
-        // // can be shifted by 8!
-        // Fillx16(dmaBuffer,
-        //     data,
-        //     sizeData,
-        //     muxId,
-        //     EncodedZeroBit64,
-        //     EncodedOneBit64);
+        // 1234  - order
+        // 3412  = actual due to endianness
+        //                                00000001
+        const uint32_t EncodedZeroBit = 0x00000100;
+        //                                00010101
+        const uint32_t EncodedOneBit =  0x01000101;
 #else
-
-        // 16 channel bits layout for DMA 64bit value
-        // note, right to left, destination is 32bit chunks
-        // due to indianness between peripheral and cpu, 
-        // bytes within the words are swapped and words within dwords
-        // in the literal constants
-        //  {       } {       }
-        //  0123 4567 89ab cdef - order of bytes in literal constant
-        //  efcd ab89 6745 2301 - order of memory on ESP32 due to Endianness
-        //  6745 2301 efcd ab89 - 32bit dest means only map using 32bits so swap upper and lower
+        //  8 channel bits layout for DMA 32bit value
+        //  note, right to left
+        //  mux bus bit/id     76543210 76543210 76543210 76543210
+        //  encode bit #       3        2        1        0
+        //  value zero         0        0        0        1
+        //  value one          0        1        1        1    
         //
-        // Due to final bit locations, can't shift encoded one bit
-        // either left more than 7 or right more than 7 so we have to
-        // split the updates and use different encodings
-        // if (muxId < 8)
-        // {
-        //     // endian + dest swap               0000000000000001 
-        //     const uint64_t EncodedZeroBit64 = 0x0000000001000000;
-        //     //  endian + dest swap             0000000100010001 
-        //     const uint64_t EncodedOneBit64 = 0x0100000001000100; 
-        //     // cant be shifted by 8!
-        //     Fillx16(dmaBuffer,
-        //         data,
-        //         sizeData,
-        //         muxId,
-        //         EncodedZeroBit64,
-        //         EncodedOneBit64);
-        // }
-        // else
-        // {
-        //     // endian + dest swap               0000000000000001 
-        //     // then pre shift by 8              0000000000000100
-        //     const uint64_t EncodedZeroBit64 = 0x0000000000010000;
-        //     //  endian + dest swap             0000000100010001 
-        //     // then pre shift by 8             0000010001000100
-        //     const uint64_t EncodedOneBit64 = 0x0001000000010001;
-        //     Fillx16(dmaBuffer,
-        //         data,
-        //         sizeData,
-        //         muxId - 8, // preshifted
-        //         EncodedZeroBit64,
-        //         EncodedOneBit64);
-        // }
+        // due to indianness between peripheral and cpu, bytes within the words are swapped in the const
+        // 1234  - order
+        // 3412  = actual due to endianness
+        //                                00000001
+        const uint32_t EncodedZeroBit = 0x00010000;
+        //                               00010101
+        const uint32_t EncodedOneBit = 0x01010001;
 #endif
-    }
 
-protected:
-    static void Fillx16(uint8_t** dmaBuffer, 
-        const uint8_t* data,
-        size_t sizeData,
-        uint8_t muxShift,
-        const uint64_t EncodedZeroBit64,
-        const uint64_t EncodedOneBit64)
-    {
-        uint64_t* pDma64 = reinterpret_cast<uint64_t*>(*dmaBuffer);
+        uint32_t* pDma = reinterpret_cast<uint32_t*>(*dmaBuffer);
         const uint8_t* pEnd = data + sizeData;
 
         for (const uint8_t* pPixel = data; pPixel < pEnd; pPixel++)
@@ -108,15 +60,15 @@ protected:
 
             for (uint8_t bit = 0; bit < 8; bit++)
             {
-                uint64_t dma64 = *(pDma64);
+                uint32_t dma = *(pDma);
 
-                dma64 |= (((value & 0x80) ? EncodedOneBit64 : EncodedZeroBit64) << (muxShift));
-                *(pDma64++) = dma64;
+                dma |= (((value & 0x80) ? EncodedOneBit : EncodedZeroBit) << (muxId));
+                *(pDma++) = dma;
                 value <<= 1;
             }
         }
         // return the buffer pointer advanced by encoding progress
-        *dmaBuffer = reinterpret_cast<uint8_t*>(pDma64);
+        *dmaBuffer = reinterpret_cast<uint8_t*>(pDma);
     }
 };
 
@@ -124,7 +76,7 @@ protected:
 // tracks mux channels used and if updated
 // 
 // T_FLAG - type used to store bit flags, UINT16_t for 16 channels
-// T_MUXSIZE - true size of mux channel = NeoEspLcdMuxBusSize16Bit
+// T_MUXSIZE - true size of mux channel = NeoEspLcdMuxBusSize8Bit
 //
 template<typename T_FLAG, typename T_MUXSIZE> 
 class NeoEspLcdMuxMap : public T_MUXSIZE
@@ -554,7 +506,7 @@ private:
 
 
 
-typedef NeoEsp32LcdMuxBus<NeoEspLcdMonoBuffContext<NeoEspLcdMuxMap<uint16_t, NeoEspLcdMuxBusSize16Bit>>> NeoEsp32Lcd0Mux16Bus;
+typedef NeoEsp32LcdMuxBus<NeoEspLcdMonoBuffContext<NeoEspLcdMuxMap<uint8_t, NeoEspLcdMuxBusSize8Bit>>> NeoEsp32LcdMux16Bus;
 
 class NeoEsp32LcdSpeedWs2812x
 {
@@ -563,7 +515,7 @@ public:
     const static uint16_t ResetTimeUs = 300;
 };
 
-typedef NeoEsp32LcdXMethodBase<NeoEsp32LcdSpeedWs2812x, NeoEsp32Lcd0Mux16Bus> NeoEsp32Lcd0X16Ws2812xMethod;
+typedef NeoEsp32LcdXMethodBase<NeoEsp32LcdSpeedWs2812x, NeoEsp32LcdMux16Bus> NeoEsp32LcdX16Ws2812xMethod;
 
 
 #endif // defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_IDF_TARGET_ESP32S3)
