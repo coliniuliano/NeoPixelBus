@@ -469,7 +469,7 @@ public:
 
     void Initialize()
     {
-        _bus.Initialize(_pin, T_SPEED::LcdSampleRate, false);
+        _bus.Initialize(_pin, T_SPEED::LcdSampleRate);
     }
 
     template <typename T_COLOR_OBJECT,
@@ -559,7 +559,7 @@ typedef NeoEsp32LcdMuxBus<NeoEspLcdMonoBuffContext<NeoEspLcdMuxMap<uint16_t, Neo
 class NeoEsp32LcdSpeedWs2812x
 {
 public:
-    const static uint32_t I2sSampleRate = 100000;
+    const static uint32_t LcdSampleRate = 100000;
     const static uint16_t ByteSendTimeUs = 10;
     const static uint16_t ResetTimeUs = 300;
 };
