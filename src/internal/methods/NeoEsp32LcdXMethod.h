@@ -4,7 +4,11 @@
 
 extern "C"
 {
+#include <driver/periph_ctrl.h>
 #include <rom/gpio.h>
+#include <hal/dma_types.h>
+#include <hal/gpio_hal.h>
+#include <soc/lcd_cam_struct.h>
 }
 
 // ESP32 Endian Map
@@ -217,6 +221,18 @@ public:
 //             // T_MUXMAP::MuxBusDataSize = the true size of data for selected mux mode (not exposed size as i2s0 only supports 16bit mode)
 //             LcdBufferSize = MuxMap.MaxBusDataSize * 8 * DmaBitsPerPixelBit * T_MUXMAP::MuxBusDataSize;
 
+            uint16_t numLEDs = MuxMap.MaxBusDataSize * 8; // (total, all strips) TODO: dont hardcode the 8, but its inconsistent between 8 and 16 bit classes?
+            uint8_t bytesPerPixel = 3; // TODO: dont hardcode, 3 for RGB, 4 for RGBW
+
+            // COLIN TODO: why 3 everywhere? is that the bytesPerPixel value?
+            uint32_t xfer_size = numLEDs * bytesPerPixel * 3;
+            uint32_t buf_size = xfer_size + 3;        // +3 for long align
+            int num_desc = (xfer_size + 4094) / 4095; // sic. (NOT 4096)
+            uint32_t alloc_size =
+                num_desc * sizeof(dma_descriptor_t) + (/*dbuf ? buf_size * 2 : */buf_size);
+
+            LcdBufferSize = alloc_size;
+
 //             // must have a 4 byte aligned buffer for i2s
 //             uint32_t alignment = LcdBufferSize % 4;
 //             if (alignment)
@@ -226,13 +242,21 @@ public:
 
 //             size_t dmaBlockCount = (LcdBufferSize + I2S_DMA_MAX_DATA_LEN - 1) / I2S_DMA_MAX_DATA_LEN;
 
-//             LcdBuffer = static_cast<uint8_t*>(heap_caps_malloc(LcdBufferSize, MALLOC_CAP_DMA));
-//             if (LcdBuffer == nullptr)
-//             {
-//                 log_e("send buffer memory allocation failure (size %u)",
-//                     LcdBufferSize);
-//             }
-//             memset(LcdBuffer, 0x00, LcdBufferSize);
+            LcdBuffer = static_cast<uint8_t*>(heap_caps_malloc(LcdBufferSize, MALLOC_CAP_DMA));
+            if (LcdBuffer == nullptr)
+            {
+                log_e("send buffer memory allocation failure (size %u)",
+                    LcdBufferSize);
+            }
+            memset(LcdBuffer, 0x00, LcdBufferSize);
+
+            // Find first 32-bit aligned address following descriptor list
+            uint32_t *alignedAddr =
+                (uint32_t *)((uint32_t)(&LcdBuffer[num_desc * sizeof(dma_descriptor_t) + 3]) & ~3);
+            uint8_t *dmaBuf = (uint8_t *)alignedAddr[0];
+
+            // Colin note: LcdBuffer is no longer just pixel data, it's also got descriptors
+            // DMA buffer starts at dmaBuf not at LcdBuffer
 
 //             i2sInit(busNumber,
 //                 true,
@@ -251,6 +275,66 @@ public:
 //                 dmaBlockCount,
 //                 LcdBuffer,
 //                 LcdBufferSize);
+
+            // LCD_CAM isn't enabled by default -- MUST begin with this:
+            periph_module_enable(PERIPH_LCD_CAM_MODULE);
+            periph_module_reset(PERIPH_LCD_CAM_MODULE);
+
+            // Reset LCD bus
+            LCD_CAM.lcd_user.lcd_reset = 1;
+            esp_rom_delay_us(100);
+
+            // Configure LCD clock
+            LCD_CAM.lcd_clock.clk_en = 1;             // Enable clock
+            LCD_CAM.lcd_clock.lcd_clk_sel = 2;        // PLL240M source
+            LCD_CAM.lcd_clock.lcd_clkm_div_a = 1;     // 1/1 fractional divide,
+            LCD_CAM.lcd_clock.lcd_clkm_div_b = 1;     // plus '99' below yields...
+            LCD_CAM.lcd_clock.lcd_clkm_div_num = 99;  // 1:100 prescale (2.4 MHz CLK)
+            LCD_CAM.lcd_clock.lcd_ck_out_edge = 0;    // PCLK low in 1st half cycle
+            LCD_CAM.lcd_clock.lcd_ck_idle_edge = 0;   // PCLK low idle
+            LCD_CAM.lcd_clock.lcd_clk_equ_sysclk = 1; // PCLK = CLK (ignore CLKCNT_N)
+
+            // Configure frame format
+            LCD_CAM.lcd_ctrl.lcd_rgb_mode_en = 0;    // i8080 mode (not RGB)
+            LCD_CAM.lcd_rgb_yuv.lcd_conv_bypass = 0; // Disable RGB/YUV converter
+            LCD_CAM.lcd_misc.lcd_next_frame_en = 0;  // Do NOT auto-frame
+            LCD_CAM.lcd_data_dout_mode.val = 0;      // No data delays
+            LCD_CAM.lcd_user.lcd_always_out_en = 1;  // Enable 'always out' mode
+            LCD_CAM.lcd_user.lcd_8bits_order = 0;    // Do not swap bytes
+            LCD_CAM.lcd_user.lcd_bit_order = 0;      // Do not reverse bit order
+            LCD_CAM.lcd_user.lcd_2byte_en = 0;       // 8-bit data mode
+            LCD_CAM.lcd_user.lcd_dummy = 1;          // Dummy phase(s) @ LCD start
+            LCD_CAM.lcd_user.lcd_dummy_cyclelen = 0; // 1 dummy phase
+            LCD_CAM.lcd_user.lcd_cmd = 0;            // No command at LCD start
+            // Dummy phase(s) MUST be enabled for DMA to trigger reliably.
+
+            // Colin TODO (pin stuff goes elsewhere)
+            // const uint8_t mux[] = {
+            //     LCD_DATA_OUT0_IDX, LCD_DATA_OUT1_IDX, LCD_DATA_OUT2_IDX,
+            //     LCD_DATA_OUT3_IDX, LCD_DATA_OUT4_IDX, LCD_DATA_OUT5_IDX,
+            //     LCD_DATA_OUT6_IDX, LCD_DATA_OUT7_IDX,
+            // };
+
+            // // Route LCD signals to GPIO pins
+            // for (int i = 0; i < 8; i++) {
+            //     if (pins[i] >= 0) {
+            //     esp_rom_gpio_connect_out_signal(pins[i], mux[i], false, false);
+            //     gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[pins[i]], PIN_FUNC_GPIO);
+            //     gpio_set_drive_capability((gpio_num_t)pins[i], (gpio_drive_cap_t)3);
+            //     bitmask[i] = 1 << i;
+            // }
+
+            // Set up DMA descriptor list (length and data are set before xfer)
+            desc = (dma_descriptor_t *)LcdBuffer; // At start of alloc'd buffer
+            for (int i = 0; i < num_desc; i++) {
+                desc[i].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+                desc[i].dw0.suc_eof = 0;
+                desc[i].next = &desc[i + 1];
+            }
+            desc[num_desc - 1].dw0.suc_eof = 1;
+            desc[num_desc - 1].next = NULL;
+
+            // Colin TODO
         }
     }
 
@@ -506,7 +590,7 @@ private:
 
 
 
-typedef NeoEsp32LcdMuxBus<NeoEspLcdMonoBuffContext<NeoEspLcdMuxMap<uint8_t, NeoEspLcdMuxBusSize8Bit>>> NeoEsp32LcdMux16Bus;
+typedef NeoEsp32LcdMuxBus<NeoEspLcdMonoBuffContext<NeoEspLcdMuxMap<uint8_t, NeoEspLcdMuxBusSize8Bit>>> NeoEsp32LcdMux8Bus;
 
 class NeoEsp32LcdSpeedWs2812x
 {
@@ -515,7 +599,7 @@ public:
     const static uint16_t ResetTimeUs = 300;
 };
 
-typedef NeoEsp32LcdXMethodBase<NeoEsp32LcdSpeedWs2812x, NeoEsp32LcdMux16Bus> NeoEsp32LcdX16Ws2812xMethod;
+typedef NeoEsp32LcdXMethodBase<NeoEsp32LcdSpeedWs2812x, NeoEsp32LcdMux8Bus> NeoEsp32LcdX8Ws2812xMethod;
 
 
 #endif // defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_IDF_TARGET_ESP32S3)
