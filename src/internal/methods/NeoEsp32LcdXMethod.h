@@ -5,22 +5,12 @@
 extern "C"
 {
 #include <driver/periph_ctrl.h>
+#include <esp_private/gdma.h>
 #include <rom/gpio.h>
 #include <hal/dma_types.h>
 #include <hal/gpio_hal.h>
 #include <soc/lcd_cam_struct.h>
 }
-
-// ESP32 Endian Map
-// uint16_t
-//   1234
-//   3412
-// uint32_t
-//   12345678
-//   78563412
-// uint64_t
-//   0123456789abcdef
-//   efcdab8967452301
 
 class NeoEspLcdMuxBusSize8Bit
 {
@@ -31,14 +21,6 @@ public:
 
     static void EncodeIntoDma(uint8_t** dmaBuffer, const uint8_t* data, size_t sizeData, uint8_t muxId)
     {
-#if defined(CONFIG_IDF_TARGET_ESP32S2)
-        // 1234  - order
-        // 3412  = actual due to endianness
-        //                                00000001
-        const uint32_t EncodedZeroBit = 0x00000100;
-        //                                00010101
-        const uint32_t EncodedOneBit =  0x01000101;
-#else
         //  8 channel bits layout for DMA 32bit value
         //  note, right to left
         //  mux bus bit/id     76543210 76543210 76543210 76543210
@@ -53,7 +35,6 @@ public:
         const uint32_t EncodedZeroBit = 0x00010000;
         //                               00010101
         const uint32_t EncodedOneBit = 0x01010001;
-#endif
 
         uint32_t* pDma = reinterpret_cast<uint32_t*>(*dmaBuffer);
         const uint8_t* pEnd = data + sizeData;
@@ -180,6 +161,24 @@ public:
     }
 };
 
+static IRAM_ATTR bool dma_callback(gdma_channel_handle_t dma_chan,
+                                   gdma_event_data_t *event_data,
+                                   void *user_data) {
+  // DMA callback seems to occur a moment before the last data has issued
+  // (perhaps buffering between DMA and the LCD peripheral?), so pause a
+  // moment before clearing the lcd_start flag. This figure was determined
+  // empirically, not science...may need to increase if last-pixel trouble.
+  esp_rom_delay_us(5);
+  LCD_CAM.lcd_user.lcd_start = 0;
+  // lastBitTime is NOT set in the callback because it would periodically
+  // have a 'too early' value. Instead, it's set in the show() function
+  // after the lcd_start flag is clear...which shouldn't make a difference,
+  // but does. The result is that it's periodically 'too late' in that
+  // case...but this just results in an infrequent slightly-long latch,
+  // rather than a too-short one that could cause refresh problems.
+  return true;
+}
+
 //
 // Implementation of a Single Buffered version of a LcdContext
 // Manages the underlying I2S details including the buffer
@@ -197,6 +196,8 @@ public:
     size_t LcdBufferSize; // total size of LcdBuffer
     uint8_t* LcdBuffer;    // holds the DMA buffer that is referenced by LcdBufDesc
     T_MUXMAP MuxMap;
+    dma_descriptor_t* desc;
+    gdma_channel_handle_t dma_chan;
 
     // as a static instance, all members get initialized to zero
     // and the constructor is called at inconsistent time to other globals
@@ -211,7 +212,7 @@ public:
     {
     }
 
-    void Construct(const uint8_t busNumber)
+    void Construct()
     {
         // construct only once on first time called
         if (LcdBuffer == nullptr)
@@ -334,7 +335,20 @@ public:
             desc[num_desc - 1].dw0.suc_eof = 1;
             desc[num_desc - 1].next = NULL;
 
-            // Colin TODO
+            // Alloc DMA channel & connect it to LCD periph
+            gdma_channel_alloc_config_t dma_chan_config = {
+                .sibling_chan = NULL,
+                .direction = GDMA_CHANNEL_DIRECTION_TX,
+                .flags = {.reserve_sibling = 0}};
+            gdma_new_channel(&dma_chan_config, &dma_chan);
+            gdma_connect(dma_chan, GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_LCD, 0));
+            gdma_strategy_config_t strategy_config = {.owner_check = false,
+                                                        .auto_update_desc = false};
+            gdma_apply_strategy(dma_chan, &strategy_config);
+
+            // Enable DMA transfer callback
+            gdma_tx_event_callbacks_t tx_cbs = {.on_trans_eof = dma_callback};
+            gdma_register_tx_event_callbacks(dma_chan, &tx_cbs, NULL);
         }
     }
 
@@ -380,7 +394,7 @@ public:
     }
 
 
-    void StartWrite(uint8_t i2sBusNumber)
+    void StartWrite()
     {
         if (MuxMap.IsAllMuxBusesUpdated())
         {
@@ -410,9 +424,12 @@ public:
         _muxId = s_context.MuxMap.RegisterNewMuxBus(dataSize);
     }
 
+    // COLIN: aka begin()
+    // COLIN: Construct only happens once, handles buffers
+    // COLIN: this part happens for each strip, handles pin setup
     void Initialize(uint8_t pin)
     {
-        s_context.Construct(0);
+        s_context.Construct();
         //i2sSetPins(T_BUS::LcdBusNumber, pin, _muxId, s_context.MuxMap.MuxBusDataSize, invert);
         // TODO: lcd set pins?
     }
@@ -454,7 +471,7 @@ public:
     void EndUpdate()
     {
         s_context.MuxMap.MarkMuxBusUpdated(_muxId);
-        s_context.StartWrite(0); // only when all buses are update is actual write started
+        s_context.StartWrite(); // only when all buses are update is actual write started
     }
 
 private:
@@ -485,7 +502,10 @@ public:
         _pixelCount(pixelCount),
         _bus()
     {
-        _bus.RegisterNewMuxBus((pixelCount * elementSize + settingsSize) + T_SPEED::ResetTimeUs / T_SPEED::ByteSendTimeUs);
+        // COLIN: dataSize = number of bytes in the whole stream
+        // COLIN: muxbus keeps track of the longest strand by number of bytes
+        size_t numResetBytes = T_SPEED::ResetTimeUs / T_SPEED::ByteSendTimeUs;
+        _bus.RegisterNewMuxBus((pixelCount * elementSize + settingsSize) + numResetBytes);
     }
 
     ~NeoEsp32LcdXMethodBase()
