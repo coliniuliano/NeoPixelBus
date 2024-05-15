@@ -6,7 +6,8 @@ extern "C"
 {
 #include <driver/periph_ctrl.h>
 #include <esp_private/gdma.h>
-#include <rom/gpio.h>
+// #include <rom/gpio.h>
+#include <esp_rom_gpio.h>
 #include <hal/dma_types.h>
 #include <hal/gpio_hal.h>
 #include <soc/lcd_cam_struct.h>
@@ -114,7 +115,6 @@ public:
         }
         return muxId;
     }
-
 
     bool DeregisterMuxBus(uint8_t muxId)
     {
@@ -309,22 +309,6 @@ public:
             LCD_CAM.lcd_user.lcd_cmd = 0;            // No command at LCD start
             // Dummy phase(s) MUST be enabled for DMA to trigger reliably.
 
-            // Colin TODO (pin stuff goes elsewhere)
-            // const uint8_t mux[] = {
-            //     LCD_DATA_OUT0_IDX, LCD_DATA_OUT1_IDX, LCD_DATA_OUT2_IDX,
-            //     LCD_DATA_OUT3_IDX, LCD_DATA_OUT4_IDX, LCD_DATA_OUT5_IDX,
-            //     LCD_DATA_OUT6_IDX, LCD_DATA_OUT7_IDX,
-            // };
-
-            // // Route LCD signals to GPIO pins
-            // for (int i = 0; i < 8; i++) {
-            //     if (pins[i] >= 0) {
-            //     esp_rom_gpio_connect_out_signal(pins[i], mux[i], false, false);
-            //     gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[pins[i]], PIN_FUNC_GPIO);
-            //     gpio_set_drive_capability((gpio_num_t)pins[i], (gpio_drive_cap_t)3);
-            //     bitmask[i] = 1 << i;
-            // }
-
             // Set up DMA descriptor list (length and data are set before xfer)
             desc = (dma_descriptor_t *)LcdBuffer; // At start of alloc'd buffer
             for (int i = 0; i < num_desc; i++) {
@@ -352,15 +336,18 @@ public:
         }
     }
 
-    void Destruct(const uint8_t busNumber)
+    void Destruct()
     {
         if (LcdBuffer == nullptr)
         {
             return;
         }
 
+        // COLIN TODO: destroy peripheral pin settings?
         // i2sSetPins(busNumber, -1, -1, -1, false);
         // i2sDeinit(busNumber);
+
+        gdma_reset(dma_chan);
 
         heap_caps_free(LcdBuffer);
 
@@ -382,6 +369,8 @@ public:
         }
     }
 
+    // COLIN: called 8 times, fills in 1 pin's worth
+    // COLIN: but the pins are assigned to a bit, so use the bit (muxid)
     void FillBuffer(uint8_t** dmaBuffer,
             const uint8_t* data, 
             size_t sizeData, 
@@ -393,16 +382,28 @@ public:
             muxId);
     }
 
-
+    // COLIN: aka show(), called 8 times
     void StartWrite()
     {
         if (MuxMap.IsAllMuxBusesUpdated())
         {
             MuxMap.ResetMuxBusesUpdated();
+            // COLIN TODO: start actual write here
             // i2sWrite(i2sBusNumber);
         }
     }
 };
+
+
+
+
+
+
+
+
+
+
+
 
 
 //
@@ -424,24 +425,23 @@ public:
         _muxId = s_context.MuxMap.RegisterNewMuxBus(dataSize);
     }
 
-    // COLIN: aka begin()
-    // COLIN: Construct only happens once, handles buffers
-    // COLIN: this part happens for each strip, handles pin setup
     void Initialize(uint8_t pin)
     {
         s_context.Construct();
-        //i2sSetPins(T_BUS::LcdBusNumber, pin, _muxId, s_context.MuxMap.MuxBusDataSize, invert);
-        // TODO: lcd set pins?
+
+        uint8_t muxIdx = LCD_DATA_OUT0_IDX + _muxId;
+        esp_rom_gpio_connect_out_signal(pin, muxIdx, false, false);
+        gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[pin], PIN_FUNC_GPIO);
+        gpio_set_drive_capability((gpio_num_t)pin, (gpio_drive_cap_t)3);
     }
 
     void DeregisterMuxBus(uint8_t pin)
     {
         if (s_context.MuxMap.DeregisterMuxBus(_muxId))
         {
-            s_context.Destruct(0);
+            s_context.Destruct();
         }
 
-        // disconnect muxed pin
         gpio_matrix_out(pin, SIG_GPIO_OUT_IDX, false, false);
         pinMode(pin, INPUT);
 
@@ -450,9 +450,8 @@ public:
 
     bool IsWriteDone() const
     {
-        // return i2sWriteDone(0);
-        return true;
-        // TODO
+        bool busy = LCD_CAM.lcd_user.lcd_start;
+        return !busy;
     }
 
     uint8_t* BeginUpdate()
@@ -481,10 +480,6 @@ private:
 
 template<typename T_BUSCONTEXT> T_BUSCONTEXT NeoEsp32LcdMuxBus<T_BUSCONTEXT>::s_context = T_BUSCONTEXT();
 
-
-
-
-
 //
 // wrapping layer of the lcd mux bus as a NeoMethod
 // 
@@ -502,10 +497,9 @@ public:
         _pixelCount(pixelCount),
         _bus()
     {
-        // COLIN: dataSize = number of bytes in the whole stream
-        // COLIN: muxbus keeps track of the longest strand by number of bytes
         size_t numResetBytes = T_SPEED::ResetTimeUs / T_SPEED::ByteSendTimeUs;
-        _bus.RegisterNewMuxBus((pixelCount * elementSize + settingsSize) + numResetBytes);
+        size_t numTotalBytes = (pixelCount * elementSize) + settingsSize + numResetBytes;
+        _bus.RegisterNewMuxBus(numTotalBytes);
     }
 
     ~NeoEsp32LcdXMethodBase()
@@ -598,23 +592,12 @@ private:
     T_BUS _bus;          // holds instance for mux bus support
 };
 
-
-
-
-
-
-
-
-
-
-
-
-
 typedef NeoEsp32LcdMuxBus<NeoEspLcdMonoBuffContext<NeoEspLcdMuxMap<uint8_t, NeoEspLcdMuxBusSize8Bit>>> NeoEsp32LcdMux8Bus;
 
 class NeoEsp32LcdSpeedWs2812x
 {
 public:
+    // COLIN: used to calculate how many bytes a reset pulse is in DMA
     const static uint16_t ByteSendTimeUs = 10;
     const static uint16_t ResetTimeUs = 300;
 };
