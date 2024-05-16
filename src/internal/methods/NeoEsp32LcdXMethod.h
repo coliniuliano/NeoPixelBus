@@ -194,7 +194,8 @@ public:
     const static size_t DmaBitsPerPixelBit = 4;
 
     size_t LcdBufferSize; // total size of LcdBuffer
-    uint8_t* LcdBuffer;    // holds the DMA buffer that is referenced by LcdBufDesc
+    uint8_t* LcdBuffer;    // holds the pointer to the allocated LCD buffer
+    uint8_t* DmaBuffer;     // holds the pointer to the aligned part of the LCD buffer for DMA
     T_MUXMAP MuxMap;
     dma_descriptor_t* desc;
     gdma_channel_handle_t dma_chan;
@@ -225,23 +226,14 @@ public:
             uint16_t numLEDs = MuxMap.MaxBusDataSize * 8; // (total, all strips) TODO: dont hardcode the 8, but its inconsistent between 8 and 16 bit classes?
             uint8_t bytesPerPixel = 3; // TODO: dont hardcode, 3 for RGB, 4 for RGBW
 
-            // COLIN TODO: why 3 everywhere? is that the bytesPerPixel value?
+            // COLIN TODO: why 3 everywhere? is that the DmaBitsPerPixelBit value?
             uint32_t xfer_size = numLEDs * bytesPerPixel * 3;
             uint32_t buf_size = xfer_size + 3;        // +3 for long align
             int num_desc = (xfer_size + 4094) / 4095; // sic. (NOT 4096)
             uint32_t alloc_size =
-                num_desc * sizeof(dma_descriptor_t) + (/*dbuf ? buf_size * 2 : */buf_size);
+                num_desc * sizeof(dma_descriptor_t) + buf_size;
 
             LcdBufferSize = alloc_size;
-
-//             // must have a 4 byte aligned buffer for i2s
-//             uint32_t alignment = LcdBufferSize % 4;
-//             if (alignment)
-//             {
-//                 LcdBufferSize += 4 - alignment;
-//             }
-
-//             size_t dmaBlockCount = (LcdBufferSize + I2S_DMA_MAX_DATA_LEN - 1) / I2S_DMA_MAX_DATA_LEN;
 
             LcdBuffer = static_cast<uint8_t*>(heap_caps_malloc(LcdBufferSize, MALLOC_CAP_DMA));
             if (LcdBuffer == nullptr)
@@ -255,27 +247,7 @@ public:
             uint32_t *alignedAddr =
                 (uint32_t *)((uint32_t)(&LcdBuffer[num_desc * sizeof(dma_descriptor_t) + 3]) & ~3);
             uint8_t *dmaBuf = (uint8_t *)alignedAddr[0];
-
-            // Colin note: LcdBuffer is no longer just pixel data, it's also got descriptors
-            // DMA buffer starts at dmaBuf not at LcdBuffer
-
-//             i2sInit(busNumber,
-//                 true,
-//                 T_MUXMAP::MuxBusDataSize,
-//                 i2sSampleRate,
-// #if defined(CONFIG_IDF_TARGET_ESP32S2)
-// // using these modes on ESP32S2 actually allows it to function
-// // in both x8 and x16
-//                 I2S_CHAN_STEREO,
-//                 I2S_FIFO_16BIT_DUAL,
-// #else
-// // but they won't work on ESP32 in parallel mode, but these will
-//                 I2S_CHAN_RIGHT_TO_LEFT,
-//                 I2S_FIFO_16BIT_SINGLE,
-// #endif
-//                 dmaBlockCount,
-//                 LcdBuffer,
-//                 LcdBufferSize);
+            DmaBuffer = dmaBuf;
 
             // LCD_CAM isn't enabled by default -- MUST begin with this:
             periph_module_enable(PERIPH_LCD_CAM_MODULE);
@@ -344,6 +316,7 @@ public:
         }
 
         // COLIN TODO: destroy peripheral pin settings?
+        // COLIN note: this stuff isnt in adafruit library
         // i2sSetPins(busNumber, -1, -1, -1, false);
         // i2sDeinit(busNumber);
 
@@ -369,8 +342,6 @@ public:
         }
     }
 
-    // COLIN: called 8 times, fills in 1 pin's worth
-    // COLIN: but the pins are assigned to a bit, so use the bit (muxid)
     void FillBuffer(uint8_t** dmaBuffer,
             const uint8_t* data, 
             size_t sizeData, 
@@ -390,6 +361,10 @@ public:
             MuxMap.ResetMuxBusesUpdated();
             // COLIN TODO: start actual write here
             // i2sWrite(i2sBusNumber);
+            gdma_reset(dma_chan);
+            LCD_CAM.lcd_user.lcd_dout = 1;
+            LCD_CAM.lcd_user.lcd_update = 1;
+            LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
         }
     }
 };
@@ -457,7 +432,7 @@ public:
     uint8_t* BeginUpdate()
     {
         s_context.ResetBuffer();
-        return s_context.LcdBuffer;
+        return s_context.DmaBuffer;
     }
 
     void FillBuffer(uint8_t** dmaBuffer,
