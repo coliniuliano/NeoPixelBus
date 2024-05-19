@@ -191,7 +191,10 @@ template<typename T_MUXMAP>
 class NeoEspLcdMonoBuffContext 
 {
 public:
-    const static size_t DmaBitsPerPixelBit = 4;
+    // COLIN - to write a "bit" to the leds, takes 3 dma writes
+    // COLIN - it goes high, (data bit), then low
+    // COLIN - so eg 3x (10us) to make a whole 30us "bit"
+    const static size_t DmaBitsPerPixelBit = 3;
 
     size_t LcdBufferSize; // total size of LcdBuffer
     uint8_t* LcdBuffer;    // holds the pointer to the allocated LCD buffer
@@ -226,8 +229,7 @@ public:
             uint16_t numLEDs = MuxMap.MaxBusDataSize * 8; // (total, all strips) TODO: dont hardcode the 8, but its inconsistent between 8 and 16 bit classes?
             uint8_t bytesPerPixel = 3; // TODO: dont hardcode, 3 for RGB, 4 for RGBW
 
-            // COLIN TODO: why 3 everywhere? is that the DmaBitsPerPixelBit value?
-            uint32_t xfer_size = numLEDs * bytesPerPixel * 3;
+            uint32_t xfer_size = numLEDs * bytesPerPixel * DmaBitsPerPixelBit;
             uint32_t buf_size = xfer_size + 3;        // +3 for long align
             int num_desc = (xfer_size + 4094) / 4095; // sic. (NOT 4096)
             uint32_t alloc_size =
@@ -365,6 +367,31 @@ public:
             LCD_CAM.lcd_user.lcd_dout = 1;
             LCD_CAM.lcd_user.lcd_update = 1;
             LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
+
+            uint8_t bytesPerPixel = 3;  // TODO: dont hardcode, 3 for RGB, 4 for RGBW
+            uint16_t numLEDs = MuxMap.MaxBusDataSize;
+            uint32_t xfer_size = numLEDs * bytesPerPixel * DmaBitsPerPixelBit;
+            int num_desc = (xfer_size + 4094) / 4095; // sic. (NOT 4096)
+
+            int bytesToGo = xfer_size;
+            int offset = 0;
+            for (int i = 0; i < num_desc; i++) {
+                int bytesThisPass = bytesToGo;
+                if (bytesThisPass > 4095)
+                bytesThisPass = 4095;
+                desc[i].dw0.size = desc[i].dw0.length = bytesThisPass;
+                desc[i].buffer = &DmaBuffer[offset];
+                bytesToGo -= bytesThisPass;
+                offset += bytesThisPass;
+            }
+
+            // COLIN: might not matter here? wled loop
+            // this is the reset time at the end?
+            //while ((micros() - lastBitTime) <= latchtime); // Wait for latch
+
+            gdma_start(dma_chan, (intptr_t)&desc[0]);
+            esp_rom_delay_us(1);
+            LCD_CAM.lcd_user.lcd_start = 1; 
         }
     }
 };
