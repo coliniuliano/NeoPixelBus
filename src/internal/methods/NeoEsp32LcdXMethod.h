@@ -20,39 +20,36 @@ public:
 
     const static size_t MuxBusDataSize = 1;
 
+    // COLIN: this is called per pixel with sizeData being number of bytes for the pixel
+    // but in theory it can be called with arbitrary sizes
     static void EncodeIntoDma(uint8_t** dmaBuffer, const uint8_t* data, size_t sizeData, uint8_t muxId)
     {
-        //  8 channel bits layout for DMA 32bit value
-        //  note, right to left
-        //  mux bus bit/id     76543210 76543210 76543210 76543210
-        //  encode bit #       3        2        1        0
-        //  value zero         0        0        0        1
-        //  value one          0        1        1        1    
-        //
-        // due to indianness between peripheral and cpu, bytes within the words are swapped in the const
-        // 1234  - order
-        // 3412  = actual due to endianness
-        //                                00000001
-        const uint32_t EncodedZeroBit = 0x00010000;
-        //                               00010101
-        const uint32_t EncodedOneBit = 0x01010001;
-
-        uint32_t* pDma = reinterpret_cast<uint32_t*>(*dmaBuffer);
+        uint8_t* pDma = reinterpret_cast<uint8_t*>(*dmaBuffer);
         const uint8_t* pEnd = data + sizeData;
 
-        for (const uint8_t* pPixel = data; pPixel < pEnd; pPixel++)
+        for (const uint8_t* pValue = data; pValue < pEnd; pValue++)
         {
-            uint8_t value = *pPixel;
+            uint8_t value = *pValue;
 
             for (uint8_t bit = 0; bit < 8; bit++)
             {
-                uint32_t dma = *(pDma);
+                // Get what's already there (offset 1)
+                uint8_t oldDma = *(pDma + 1);
 
-                dma |= (((value & 0x80) ? EncodedOneBit : EncodedZeroBit) << (muxId));
-                *(pDma++) = dma;
+                // Adjust
+                oldDma |= (value & 0x80) ? (0x01 << muxId) : 0x00;
+
+                // Write it back
+                *(pDma++) = 0xFF;
+                *(pDma++) = oldDma;
+                *(pDma++) = 0x00;
+
+                // Next
+                pDma += 3;
                 value <<= 1;
             }
         }
+
         // return the buffer pointer advanced by encoding progress
         *dmaBuffer = reinterpret_cast<uint8_t*>(pDma);
     }
@@ -194,7 +191,7 @@ public:
     // COLIN - to write a "bit" to the leds, takes 3 dma writes
     // COLIN - it goes high, (data bit), then low
     // COLIN - so eg 3x (10us) to make a whole 30us "bit"
-    const static size_t DmaBitsPerPixelBit = 3;
+    const static size_t DmaBytesPerPixelByte = 3;
 
     size_t LcdBufferSize; // total size of LcdBuffer
     uint8_t* LcdBuffer;    // holds the pointer to the allocated LCD buffer
@@ -222,14 +219,19 @@ public:
         if (LcdBuffer == nullptr)
         {
 //             // MuxMap.MaxBusDataSize = max size in bytes of a single channel
-//             // DmaBitsPerPixelBit = how many dma bits/byte are needed for each source (pixel) bit/byte
+//             // DmaBytesPerPixelByte = how many dma bits/byte are needed for each source (pixel) bit/byte
 //             // T_MUXMAP::MuxBusDataSize = the true size of data for selected mux mode (not exposed size as i2s0 only supports 16bit mode)
-//             LcdBufferSize = MuxMap.MaxBusDataSize * 8 * DmaBitsPerPixelBit * T_MUXMAP::MuxBusDataSize;
+//             LcdBufferSize = MuxMap.MaxBusDataSize * 8 * DmaBytesPerPixelByte * T_MUXMAP::MuxBusDataSize;
 
+            // NOTE MaxBusDataSize includes 10 "reset bytes" so its not an accurate count of LEDs
+            // COLIN TODO:::: fix this numLEDs up, its inaccurate
+            // COLIN TODO:::: this is probably the error spot...
+
+            // COLIN NOTE: MaxBusDataSize = (45 * 3) data bytes + 10 reset bytes = 145 bytes per strip
             uint16_t numLEDs = MuxMap.MaxBusDataSize * 8; // (total, all strips) TODO: dont hardcode the 8, but its inconsistent between 8 and 16 bit classes?
             uint8_t bytesPerPixel = 3; // TODO: dont hardcode, 3 for RGB, 4 for RGBW
 
-            uint32_t xfer_size = numLEDs * bytesPerPixel * DmaBitsPerPixelBit;
+            uint32_t xfer_size = numLEDs * bytesPerPixel * DmaBytesPerPixelByte;
             uint32_t buf_size = xfer_size + 3;        // +3 for long align
             int num_desc = (xfer_size + 4094) / 4095; // sic. (NOT 4096)
             uint32_t alloc_size =
@@ -237,7 +239,7 @@ public:
 
             LcdBufferSize = alloc_size;
 
-            LcdBuffer = static_cast<uint8_t*>(heap_caps_malloc(LcdBufferSize, MALLOC_CAP_DMA));
+            LcdBuffer = static_cast<uint8_t*>(heap_caps_malloc(LcdBufferSize, MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
             if (LcdBuffer == nullptr)
             {
                 log_e("send buffer memory allocation failure (size %u)",
@@ -248,7 +250,7 @@ public:
             // Find first 32-bit aligned address following descriptor list
             uint32_t *alignedAddr =
                 (uint32_t *)((uint32_t)(&LcdBuffer[num_desc * sizeof(dma_descriptor_t) + 3]) & ~3);
-            uint8_t *dmaBuf = (uint8_t *)alignedAddr[0];
+            uint8_t *dmaBuf = (uint8_t *)alignedAddr;
             DmaBuffer = dmaBuf;
 
             // LCD_CAM isn't enabled by default -- MUST begin with this:
@@ -341,6 +343,10 @@ public:
         {
             // clear all the data in preperation for each mux channel to add
             memset(LcdBuffer, 0x00, LcdBufferSize);
+
+            // COLIN TODO: might make sense to do the dmaFill of FF 00 00 here (all zeros = off)
+            // COLIN: no point in doing it during stage, right?
+            // COLIN: yep, do it here instead of doing it in encode...
         }
     }
 
@@ -370,7 +376,7 @@ public:
 
             uint8_t bytesPerPixel = 3;  // TODO: dont hardcode, 3 for RGB, 4 for RGBW
             uint16_t numLEDs = MuxMap.MaxBusDataSize;
-            uint32_t xfer_size = numLEDs * bytesPerPixel * DmaBitsPerPixelBit;
+            uint32_t xfer_size = numLEDs * bytesPerPixel * DmaBytesPerPixelByte;
             int num_desc = (xfer_size + 4094) / 4095; // sic. (NOT 4096)
 
             int bytesToGo = xfer_size;
@@ -500,7 +506,7 @@ public:
         _bus()
     {
         size_t numResetBytes = T_SPEED::ResetTimeUs / T_SPEED::ByteSendTimeUs;
-        size_t numTotalBytes = (pixelCount * elementSize) + settingsSize + numResetBytes;
+        size_t numTotalBytes = (pixelCount * elementSize) + numResetBytes;
         _bus.RegisterNewMuxBus(numTotalBytes);
     }
 
@@ -537,18 +543,13 @@ public:
         while (!_bus.IsWriteDone())
         {
             yield();
+            // COLIN TODO: might have to wait for latch too
+            // COLIN: but it doesnt even start filling dma until write is done, so might be enough time
         }
 
-        const size_t sendDataSize = T_COLOR_FEATURE::SettingsSize >= T_COLOR_FEATURE::PixelSize ? T_COLOR_FEATURE::SettingsSize : T_COLOR_FEATURE::PixelSize;
+        const size_t sendDataSize = T_COLOR_FEATURE::PixelSize;
         uint8_t sendData[sendDataSize];
         uint8_t* data = _bus.BeginUpdate();
-
-        // if there are settings at the front
-        //
-        if (T_COLOR_FEATURE::applyFrontSettings(sendData, sendDataSize, featureSettings))
-        {
-            _bus.FillBuffer(&data, sendData, T_COLOR_FEATURE::SettingsSize);
-        }
 
         // apply primary color data
         //
@@ -570,14 +571,6 @@ public:
                 // restart at first
                 pixel = pixels;
             }
-        }
-
-
-        // if there are settings at the back
-        //
-        if (T_COLOR_FEATURE::applyBackSettings(sendData, sendDataSize, featureSettings))
-        {
-            _bus.FillBuffer(&data, sendData, T_COLOR_FEATURE::SettingsSize);
         }
 
         _bus.EndUpdate(); // triggers actual write after all mux busses have updated
