@@ -21,10 +21,9 @@ public:
     const static size_t MuxBusDataSize = 1;
 
     // COLIN: this is called per pixel with sizeData being number of bytes for the pixel
-    // but in theory it can be called with arbitrary sizes
     static void EncodeIntoDma(uint8_t** dmaBuffer, const uint8_t* data, size_t sizeData, uint8_t muxId)
     {
-        uint8_t* pDma = reinterpret_cast<uint8_t*>(*dmaBuffer);
+        uint8_t* pDma = *dmaBuffer;
         const uint8_t* pEnd = data + sizeData;
 
         for (const uint8_t* pValue = data; pValue < pEnd; pValue++)
@@ -34,24 +33,23 @@ public:
             for (uint8_t bit = 0; bit < 8; bit++)
             {
                 // Get what's already there (offset 1)
-                uint8_t oldDma = *(pDma + 1);
+                uint8_t dmaVal = *(pDma + 1);
 
                 // Adjust
-                oldDma |= (value & 0x80) ? (0x01 << muxId) : 0x00;
+                dmaVal |= (value & 0x80) ? (0x01 << muxId) : 0x00;
 
                 // Write it back
                 *(pDma++) = 0xFF;
-                *(pDma++) = oldDma;
+                *(pDma++) = dmaVal;
                 *(pDma++) = 0x00;
 
                 // Next
-                pDma += 3;
                 value <<= 1;
             }
         }
 
         // return the buffer pointer advanced by encoding progress
-        *dmaBuffer = reinterpret_cast<uint8_t*>(pDma);
+        *dmaBuffer = pDma;
     }
 };
 
@@ -191,7 +189,7 @@ public:
     // COLIN - to write a "bit" to the leds, takes 3 dma writes
     // COLIN - it goes high, (data bit), then low
     // COLIN - so eg 3x (10us) to make a whole 30us "bit"
-    const static size_t DmaBytesPerPixelByte = 3;
+    const static size_t DmaBytesPerPixelByte = 24;
 
     size_t LcdBufferSize; // total size of LcdBuffer
     uint8_t* LcdBuffer;    // holds the pointer to the allocated LCD buffer
@@ -223,15 +221,7 @@ public:
 //             // T_MUXMAP::MuxBusDataSize = the true size of data for selected mux mode (not exposed size as i2s0 only supports 16bit mode)
 //             LcdBufferSize = MuxMap.MaxBusDataSize * 8 * DmaBytesPerPixelByte * T_MUXMAP::MuxBusDataSize;
 
-            // NOTE MaxBusDataSize includes 10 "reset bytes" so its not an accurate count of LEDs
-            // COLIN TODO:::: fix this numLEDs up, its inaccurate
-            // COLIN TODO:::: this is probably the error spot...
-
-            // COLIN NOTE: MaxBusDataSize = (45 * 3) data bytes + 10 reset bytes = 145 bytes per strip
-            uint16_t numLEDs = MuxMap.MaxBusDataSize * 8; // (total, all strips) TODO: dont hardcode the 8, but its inconsistent between 8 and 16 bit classes?
-            uint8_t bytesPerPixel = 3; // TODO: dont hardcode, 3 for RGB, 4 for RGBW
-
-            uint32_t xfer_size = numLEDs * bytesPerPixel * DmaBytesPerPixelByte;
+            uint32_t xfer_size = MuxMap.MaxBusDataSize * DmaBytesPerPixelByte;
             uint32_t buf_size = xfer_size + 3;        // +3 for long align
             int num_desc = (xfer_size + 4094) / 4095; // sic. (NOT 4096)
             uint32_t alloc_size =
@@ -347,6 +337,9 @@ public:
             // COLIN TODO: might make sense to do the dmaFill of FF 00 00 here (all zeros = off)
             // COLIN: no point in doing it during stage, right?
             // COLIN: yep, do it here instead of doing it in encode...
+            
+            // COLIN: note, the final 30 data bytes of the buffer are RESET bytes and need to be 0x00
+            // COLIN: so dont blindly fill the buffer here!!
         }
     }
 
@@ -374,9 +367,10 @@ public:
             LCD_CAM.lcd_user.lcd_update = 1;
             LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
 
-            uint8_t bytesPerPixel = 3;  // TODO: dont hardcode, 3 for RGB, 4 for RGBW
-            uint16_t numLEDs = MuxMap.MaxBusDataSize;
-            uint32_t xfer_size = numLEDs * bytesPerPixel * DmaBytesPerPixelByte;
+            // MuxMap.MaxBusDataSize = number of bytes in longest strip
+            // eg: for 45 RGB leds + 30 byte reset period = 45 * 3 + 30 = 165
+            uint32_t xfer_size = MuxMap.MaxBusDataSize * DmaBytesPerPixelByte;
+
             int num_desc = (xfer_size + 4094) / 4095; // sic. (NOT 4096)
 
             int bytesToGo = xfer_size;
