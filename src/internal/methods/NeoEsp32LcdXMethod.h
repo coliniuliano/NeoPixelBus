@@ -20,7 +20,6 @@ public:
 
     const static size_t MuxBusDataSize = 1;
 
-    // COLIN: this is called per pixel with sizeData being number of bytes for the pixel
     static void EncodeIntoDma(uint8_t** dmaBuffer, const uint8_t* data, size_t sizeData, uint8_t muxId)
     {
         uint8_t* pDma = *dmaBuffer;
@@ -159,18 +158,8 @@ public:
 static IRAM_ATTR bool dma_callback(gdma_channel_handle_t dma_chan,
                                    gdma_event_data_t *event_data,
                                    void *user_data) {
-  // DMA callback seems to occur a moment before the last data has issued
-  // (perhaps buffering between DMA and the LCD peripheral?), so pause a
-  // moment before clearing the lcd_start flag. This figure was determined
-  // empirically, not science...may need to increase if last-pixel trouble.
   esp_rom_delay_us(5);
   LCD_CAM.lcd_user.lcd_start = 0;
-  // lastBitTime is NOT set in the callback because it would periodically
-  // have a 'too early' value. Instead, it's set in the show() function
-  // after the lcd_start flag is clear...which shouldn't make a difference,
-  // but does. The result is that it's periodically 'too late' in that
-  // case...but this just results in an infrequent slightly-long latch,
-  // rather than a too-short one that could cause refresh problems.
   return true;
 }
 
@@ -186,9 +175,7 @@ template<typename T_MUXMAP>
 class NeoEspLcdMonoBuffContext 
 {
 public:
-    // COLIN - to write a "bit" to the leds, takes 3 dma writes
-    // COLIN - it goes high, (data bit), then low
-    // COLIN - so eg 3x (10us) to make a whole 30us "bit"
+    // Each data bit requires 3 DMA byes
     const static size_t DmaBytesPerPixelByte = 24;
 
     size_t LcdBufferSize; // total size of LcdBuffer
@@ -216,10 +203,9 @@ public:
         // construct only once on first time called
         if (LcdBuffer == nullptr)
         {
-//             // MuxMap.MaxBusDataSize = max size in bytes of a single channel
-//             // DmaBytesPerPixelByte = how many dma bits/byte are needed for each source (pixel) bit/byte
-//             // T_MUXMAP::MuxBusDataSize = the true size of data for selected mux mode (not exposed size as i2s0 only supports 16bit mode)
-//             LcdBufferSize = MuxMap.MaxBusDataSize * 8 * DmaBytesPerPixelByte * T_MUXMAP::MuxBusDataSize;
+            // MuxMap.MaxBusDataSize = max size in bytes of a single channel
+            // DmaBytesPerPixelByte = how many dma bits/byte are needed for each source (pixel) bit/byte
+            // T_MUXMAP::MuxBusDataSize = the true size of data for selected mux mode (not exposed size as i2s0 only supports 16bit mode)
 
             uint32_t xfer_size = MuxMap.MaxBusDataSize * DmaBytesPerPixelByte;
             uint32_t buf_size = xfer_size + 3;        // +3 for long align
@@ -309,8 +295,7 @@ public:
             return;
         }
 
-        // COLIN TODO: destroy peripheral pin settings?
-        // COLIN note: this stuff isnt in adafruit library
+        // TODO: destroy peripheral pin settings
         // i2sSetPins(busNumber, -1, -1, -1, false);
         // i2sDeinit(busNumber);
 
@@ -333,13 +318,6 @@ public:
         {
             // clear all the data in preperation for each mux channel to add
             memset(LcdBuffer, 0x00, LcdBufferSize);
-
-            // COLIN TODO: might make sense to do the dmaFill of FF 00 00 here (all zeros = off)
-            // COLIN: no point in doing it during stage, right?
-            // COLIN: yep, do it here instead of doing it in encode...
-            
-            // COLIN: note, the final 30 data bytes of the buffer are RESET bytes and need to be 0x00
-            // COLIN: so dont blindly fill the buffer here!!
         }
     }
 
@@ -354,25 +332,19 @@ public:
             muxId);
     }
 
-    // COLIN: aka show(), called 8 times
     void StartWrite()
     {
         if (MuxMap.IsAllMuxBusesUpdated())
         {
             MuxMap.ResetMuxBusesUpdated();
-            // COLIN TODO: start actual write here
-            // i2sWrite(i2sBusNumber);
+            
             gdma_reset(dma_chan);
             LCD_CAM.lcd_user.lcd_dout = 1;
             LCD_CAM.lcd_user.lcd_update = 1;
             LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
 
-            // MuxMap.MaxBusDataSize = number of bytes in longest strip
-            // eg: for 45 RGB leds + 30 byte reset period = 45 * 3 + 30 = 165
             uint32_t xfer_size = MuxMap.MaxBusDataSize * DmaBytesPerPixelByte;
-
             int num_desc = (xfer_size + 4094) / 4095; // sic. (NOT 4096)
-
             int bytesToGo = xfer_size;
             int offset = 0;
             for (int i = 0; i < num_desc; i++) {
@@ -385,28 +357,12 @@ public:
                 offset += bytesThisPass;
             }
 
-            // COLIN: might not matter here? wled loop
-            // this is the reset time at the end?
-            //while ((micros() - lastBitTime) <= latchtime); // Wait for latch
-
             gdma_start(dma_chan, (intptr_t)&desc[0]);
             esp_rom_delay_us(1);
             LCD_CAM.lcd_user.lcd_start = 1; 
         }
     }
 };
-
-
-
-
-
-
-
-
-
-
-
-
 
 //
 // Implementation of the low level interface into i2s mux bus
@@ -537,8 +493,6 @@ public:
         while (!_bus.IsWriteDone())
         {
             yield();
-            // COLIN TODO: might have to wait for latch too
-            // COLIN: but it doesnt even start filling dma until write is done, so might be enough time
         }
 
         const size_t sendDataSize = T_COLOR_FEATURE::PixelSize;
@@ -586,7 +540,7 @@ typedef NeoEsp32LcdMuxBus<NeoEspLcdMonoBuffContext<NeoEspLcdMuxMap<uint8_t, NeoE
 class NeoEsp32LcdSpeedWs2812x
 {
 public:
-    // COLIN: used to calculate how many bytes a reset pulse is in DMA
+    // Used to calculate how many bytes in a reset pulse
     const static uint16_t ByteSendTimeUs = 10;
     const static uint16_t ResetTimeUs = 300;
 };
